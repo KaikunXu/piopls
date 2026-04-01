@@ -13,11 +13,32 @@
 + **Structured Export:** Extract model parameters, sample scores, and biomarker statistics (VIP, Covariance, Correlation) as instantly usable DataFrames for downstream pipelines.
 
 ##  Installation
+You can install `pi-oplsda` using either of the following methods, depending on whether you simply want to use the package or if you plan to modify the source code.
 
-Install directly from GitHub using `pip`:
+Option 1: Install directly from GitHub (Recommended for most users)
 
 ```bash
 pip install git+https://github.com/KaikunXu/pi-oplsda.git
+```
+
+Option 2: Install from source (For developers)
+
+If you want to contribute to the project, modify the algorithm, or explore the source code, you can clone the repository and install it in "editable" mode. This means any changes you make to the local code will immediately take effect without needing to reinstall the package.
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/KaikunXu/pi-oplsda.git
+
+# 2. Navigate into the project directory
+cd pi-oplsda
+
+# 3. Install in editable mode
+pip install -e .
+```
+Note on interactive widgets: > If you plan to use the interactive visualization features within Jupyter Notebooks, you should install the optional dependencies by running:
+
+```bash
+pip install -e .[jupyter]
 ```
 
 ##  Quickstart & Tutorials
