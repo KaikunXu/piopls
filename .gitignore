@@ -1,0 +1,24 @@
+# Ignore Python compiled cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ignore test framework cache
+.pytest_cache/
+
+# Ignore folders generated during packaging and distribution
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Ignore virtual environment folders (if created within the project directory)
+venv/
+env/
+.env
+
+# Ignore Jupyter Notebook temporary files
+.ipynb_checkpoints/
+
+# Ignore system files (e.g., .DS_Store on macOS)
+.DS_Store
