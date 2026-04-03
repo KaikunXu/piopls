@@ -22,3 +22,7 @@ env/
 
 # Ignore system files (e.g., .DS_Store on macOS)
 .DS_Store
+
+# Ignore VS Code configuration and workspace files
+.vscode/
+*.code-workspace
