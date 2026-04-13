@@ -27,8 +27,7 @@ class OPLSDA:
         max_ortho (int): Maximum orthogonal components for auto-search.
         n_perms (int): Default number of permutations for validation.
         n_jobs (int): Default number of CPU cores for parallel jobs.
-        label_encoder (LabelEncoder): Encoder for categorical targets.
-        _is_categorical (bool): Flag for categorical target variable.
+        vip_method (str): 'vip4' (ropls default) or 'traditional' (W* based).
     """
 
     def __init__(
@@ -37,36 +36,43 @@ class OPLSDA:
         cv_folds=7, 
         max_ortho=10, 
         n_perms=100, 
-        n_jobs=-1
+        n_jobs=-1,
+        vip_method='vip4'
     ):
-        """Initializes the OPLSDA model with specific configurations.
-
-        Args:
-            n_ortho (int, optional): Number of orthogonal components.
-                If None, it will be automatically determined. Defaults to None.
-            cv_folds (int, optional): Folds for cross-validation. Defaults to 7.
-            max_ortho (int, optional): Max components to search. Defaults to 10.
-            n_perms (int, optional): Permutations for test. Defaults to 100.
-            n_jobs (int, optional): Cores for parallel compute. Defaults to -1.
-        """
+        """Initializes the OPLSDA model with specific configurations."""
         self.n_ortho = n_ortho       
         self.cv_folds = cv_folds     
         self.max_ortho = max_ortho
         self.n_perms = n_perms
         self.n_jobs = n_jobs
+        self.vip_method = vip_method
         self.label_encoder = LabelEncoder()
         self._is_categorical = False 
 
-    def _venetian_blinds_split(self, y_numeric):
-        """Splits data using the Venetian blinds cross-validation strategy.
-
-        Args:
-            y_numeric (np.ndarray): The numeric target array.
-
-        Returns:
-            list of tuples: A list containing (train_indices, test_indices) 
-                for each cross-validation fold.
+    def fit_pipeline(
+        self, X, y, run_permutations = True
+    ) -> dict:
+        """Executes the complete OPLS-DA pipeline in a single convenient call.
+        
+        Automatically performs model fitting, cross-validation (Q2), and 
+        optionally the permutation testing, mimicking the 'ropls' default 
+        behavior.
         """
+        # Step 1: Base model fitting
+        self.fit(X, y)
+        
+        # Step 2: Cross-validation for Q2
+        self.compute_q2(X, y)
+        
+        # Step 3: Optional Permutation Test
+        perm_results: dict = {}
+        if run_permutations:
+            perm_results = self.permutation_test(X, y)
+            
+        return perm_results
+
+    def _venetian_blinds_split(self, y_numeric):
+        """Splits data using the Stratified Venetian blinds CV strategy."""
         folds = [([], []) for _ in range(self.cv_folds)]
         for class_val in np.unique(y_numeric):
             idx_c = np.where(y_numeric == class_val)[0]
@@ -78,31 +84,23 @@ class OPLSDA:
         return [(np.array(train), np.array(test)) for train, test in folds]
 
     def _find_best_n_ortho(self, X, y_numeric):
-        """Automatically finds optimal number of orthogonal components.
-
-        Evaluates components sequentially and stops when the Q2 increment 
-        falls below the defined threshold (0.01).
-
-        Args:
-            X (np.ndarray): The feature matrix.
-            y_numeric (np.ndarray): The numeric target array.
-
-        Returns:
-            int: The optimal number of orthogonal components.
-        """
-        base_model = OPLSDA(n_ortho=0, cv_folds=self.cv_folds)
+        """Automatically finds optimal number of orthogonal components."""
+        base_model = OPLSDA(
+            n_ortho=0, cv_folds=self.cv_folds, vip_method=self.vip_method
+        )
         base_model.fit(X, y_numeric)
         base_model.compute_q2(X, y_numeric)
         best_n = 0
         q2_prev = base_model.Q2_
         
         for n in range(1, self.max_ortho + 1):
-            temp_model = OPLSDA(n_ortho=n, cv_folds=self.cv_folds)
+            temp_model = OPLSDA(
+                n_ortho=n, cv_folds=self.cv_folds, vip_method=self.vip_method
+            )
             temp_model.fit(X, y_numeric)
             temp_model.compute_q2(X, y_numeric)
             q2_curr = temp_model.Q2_
             
-            # Threshold improvement of 0.01 for Q2 to accept new component
             if q2_curr - q2_prev >= 0.01:
                 best_n = n
                 q2_prev = q2_curr
@@ -111,15 +109,7 @@ class OPLSDA:
         return max(1, best_n)
 
     def fit(self, X, y):
-        """Fits the OPLS-DA model to the provided data.
-
-        Args:
-            X (array-like): Feature matrix of shape (n_samples, n_features).
-            y (array-like): Target vector of shape (n_samples,).
-
-        Returns:
-            self: The fitted OPLSDA object.
-        """
+        """Fits the OPLS-DA model natively tolerating NaN values."""
         if hasattr(X, 'columns'):
             self.feature_names_in_ = X.columns.tolist()
         if hasattr(X, 'index'):
@@ -128,7 +118,7 @@ class OPLSDA:
         X = np.asarray(X, dtype=float)
         y_array = np.asarray(y)
         
-        if y_array.dtype.kind in {'U', 'S', 'O'}: 
+        if y_array.dtype.kind in {'U', 'S', 'O'} or len(np.unique(y_array))<=2: 
             y_numeric = self.label_encoder.fit_transform(y_array).astype(float)
             self._is_categorical = True
         else:
@@ -140,20 +130,21 @@ class OPLSDA:
         if self.n_ortho is None:
             self.n_ortho = self._find_best_n_ortho(X, y_numeric)
 
-        self.x_mean_ = X.mean(axis=0)
-        self.x_std_ = X.std(axis=0, ddof=1)
+        # NaN safe scaling
+        self.x_mean_ = np.nanmean(X, axis=0)
+        self.x_std_ = np.nanstd(X, axis=0, ddof=1)
         self.x_std_[self.x_std_ == 0] = 1.0 
         E = (X - self.x_mean_) / self.x_std_
         E_orig = E.copy() 
 
-        self.y_mean_ = y_numeric.mean()
-        self.y_std_ = y_numeric.std(ddof=1)
+        self.y_mean_ = np.nanmean(y_numeric)
+        self.y_std_ = np.nanstd(y_numeric, ddof=1)
         if self.y_std_ == 0: 
             self.y_std_ = 1.0
         f = (y_numeric - self.y_mean_) / self.y_std_
 
-        SS_X_total = np.sum(E_orig ** 2)
-        SS_Y_total = np.sum((y_numeric - self.y_mean_) ** 2)
+        SS_X_total = np.nansum(E_orig ** 2)
+        SS_Y_total = np.nansum((y_numeric - self.y_mean_) ** 2)
 
         _n_ortho = max(0, self.n_ortho)
         
@@ -161,92 +152,129 @@ class OPLSDA:
         self.P_ortho_ = np.zeros((n_features, _n_ortho)) 
         self.W_ortho_ = np.zeros((n_features, _n_ortho))
         
-        self.R2X_cum_list_ = []
-        self.R2Y_cum_list_ = []
+        self.R2Y_abs_ = []
+        r2x_ortho_list = []
 
         # ---- Step 0: Initial Predictive Component ----
-        w_pred_0 = np.dot(E.T, f)
+        w_pred_0 = np.nansum(E * f[:, np.newaxis], axis=0)
         w_pred_0 /= np.linalg.norm(w_pred_0)
         
-        t_pred_0 = np.dot(E, w_pred_0)
-        p_pred_0 = np.dot(E.T, t_pred_0) / np.dot(t_pred_0.T, t_pred_0)
-        c_pred_0 = np.dot(f.T, t_pred_0) / np.dot(t_pred_0.T, t_pred_0)
+        valid_mask = ~np.isnan(E)
+        t_pred_0 = np.nansum(E * w_pred_0, axis=1) 
+        t_pred_0 /= np.sum(valid_mask * (w_pred_0 ** 2), axis=1)
         
-        R2X_cum_0 = (np.sum(t_pred_0**2) * np.sum(p_pred_0**2)) / SS_X_total
+        p_pred_0 = np.nansum(E * t_pred_0[:, np.newaxis], axis=0) 
+        p_pred_0 /= np.nansum(t_pred_0 ** 2)
+        
+        c_pred_0 = np.nansum(f * t_pred_0) / np.nansum(t_pred_0 ** 2)
+        
         y_pred_0 = (t_pred_0 * c_pred_0) * self.y_std_ + self.y_mean_
-        R2Y_cum_0 = 1.0 - np.sum((y_numeric - y_pred_0) ** 2) / SS_Y_total
+        R2Y_cum_0 = 1.0 - np.nansum((y_numeric - y_pred_0)**2) / SS_Y_total
         
-        self.R2X_cum_list_.append(R2X_cum_0)
-        self.R2Y_cum_list_.append(R2Y_cum_0)
+        self.R2Y_abs_.append(R2Y_cum_0)
         
         if _n_ortho == 0:
             self.w_pred_ = w_pred_0
             self.t_pred_ = t_pred_0
             self.p_pred_ = p_pred_0
             self.c_pred_ = c_pred_0
-            self.R2X_ = R2X_cum_0
+            self.R2X_ = (
+                np.nansum(t_pred_0**2) * np.nansum(p_pred_0**2)) / SS_X_total
             self.R2Y_ = R2Y_cum_0
-            self.RMSEE_ = np.sqrt(np.mean((y_numeric - y_pred_0) ** 2))
+            self.RMSEE_ = np.sqrt(np.nanmean((y_numeric - y_pred_0) ** 2))
             self.fitted_values_ = y_pred_0
 
         # ---- Step 1 to n: Extract Orthogonal Components ----
         for i in range(_n_ortho):
-            w = np.dot(E.T, f)
+            w = np.nansum(E * f[:, np.newaxis], axis=0)
             w /= np.linalg.norm(w)
-            t = np.dot(E, w)
-            p = np.dot(E.T, t) / np.dot(t.T, t)
+            
+            valid_mask = ~np.isnan(E)
+            t = np.nansum(E * w, axis=1) 
+            t /= np.sum(valid_mask * (w ** 2), axis=1)
+            
+            p = np.nansum(E * t[:, np.newaxis], axis=0) / np.nansum(t ** 2)
             
             w_ortho = p - np.dot(w.T, p) * w
             w_ortho /= np.linalg.norm(w_ortho)
-            t_ortho = np.dot(E, w_ortho)
+            
+            t_ortho = np.nansum(E * w_ortho, axis=1) 
+            t_ortho /= np.sum(valid_mask * (w_ortho ** 2), axis=1)
             
             for j in range(i):
                 t_prev = self.T_ortho_[:, j]
-                proj = np.dot(t_ortho.T, t_prev) / np.dot(t_prev.T, t_prev)
+                proj = np.nansum(t_ortho * t_prev) / np.nansum(t_prev ** 2)
                 t_ortho -= proj * t_prev
                 
-            p_ortho = np.dot(E.T, t_ortho) / np.dot(t_ortho.T, t_ortho)            
+            p_ortho = np.nansum(E * t_ortho[:, np.newaxis], axis=0) 
+            p_ortho /= np.nansum(t_ortho ** 2)            
             
             self.T_ortho_[:, i] = t_ortho
             self.P_ortho_[:, i] = p_ortho
             self.W_ortho_[:, i] = w_ortho
             
+            # Record explicit R2X of this orthogonal component 
+            # (matches ropls perfectly)
+            ss_ortho_i = np.nansum(t_ortho**2) * np.nansum(p_ortho**2)
+            r2x_ortho_list.append(ss_ortho_i / SS_X_total)
+
             E = E - np.outer(t_ortho, p_ortho)
 
-            w_pred_k = np.dot(E.T, f)
+            w_pred_k = np.nansum(E * f[:, np.newaxis], axis=0)
             w_pred_k /= np.linalg.norm(w_pred_k)
-            t_pred_k = np.dot(E, w_pred_k)
+            
+            valid_mask = ~np.isnan(E)
+            t_pred_k = np.nansum(E * w_pred_k, axis=1) 
+            t_pred_k /= np.sum(valid_mask * (w_pred_k ** 2), axis=1)
             
             for j in range(i + 1):
                 t_prev = self.T_ortho_[:, j]
-                proj = np.dot(t_pred_k.T, t_prev) / np.dot(t_prev.T, t_prev)
+                proj = np.nansum(t_pred_k * t_prev) / np.nansum(t_prev ** 2)
                 t_pred_k -= proj * t_prev
 
-            p_pred_k = np.dot(E.T, t_pred_k) / np.dot(t_pred_k.T, t_pred_k)
-            c_pred_k = np.dot(f.T, t_pred_k) / np.dot(t_pred_k.T, t_pred_k)
+            p_pred_k = np.nansum(E * t_pred_k[:, np.newaxis], axis=0) 
+            p_pred_k /= np.nansum(t_pred_k ** 2)
             
-            ss_ortho = (
-                np.sum(self.T_ortho_[:, :i+1]**2, axis=0) * np.sum(
-                    self.P_ortho_[:, :i+1]**2, axis=0)
-            )
-            ss_pred = np.sum(t_pred_k**2) * np.sum(p_pred_k**2)
-            R2X_cum_k = (np.sum(ss_ortho) + ss_pred) / SS_X_total
+            c_pred_k = np.nansum(f * t_pred_k) / np.nansum(t_pred_k ** 2)
             
             y_pred_k = (t_pred_k * c_pred_k) * self.y_std_ + self.y_mean_
-            R2Y_cum_k = 1.0 - np.sum((y_numeric - y_pred_k) ** 2) / SS_Y_total
+            R2Y_cum_k = 1.0 - np.nansum((y_numeric - y_pred_k)**2) / SS_Y_total
             
-            self.R2X_cum_list_.append(R2X_cum_k)
-            self.R2Y_cum_list_.append(R2Y_cum_k)
+            self.R2Y_abs_.append(R2Y_cum_k)
             
             if i == _n_ortho - 1:
                 self.w_pred_ = w_pred_k
                 self.t_pred_ = t_pred_k
                 self.p_pred_ = p_pred_k
                 self.c_pred_ = c_pred_k
-                self.R2X_ = R2X_cum_k
-                self.R2Y_ = R2Y_cum_k
-                self.RMSEE_ = np.sqrt(np.mean((y_numeric - y_pred_k) ** 2))
+                self.RMSEE_ = np.sqrt(np.nanmean((y_numeric - y_pred_k) ** 2))
                 self.fitted_values_ = y_pred_k
+
+        # ---- Process Metrics matching ropls tables ----
+        if _n_ortho > 0:
+            # 1. R2X
+            r2x_pred = ( 
+                np.nansum(self.t_pred_**2) * np.nansum(
+                    self.p_pred_**2)) / SS_X_total
+            self.R2X_comp_ = [r2x_pred] + r2x_ortho_list
+            self.R2X_cum_list_ = list(np.cumsum(self.R2X_comp_))
+
+            # 2. R2Y (ropls specific incremental tracking for ortho components)
+            self.R2Y_comp_ = []
+            r2y_ropls_cum = []
+            for i in range(len(self.R2Y_abs_)):
+                if i == 0:
+                    self.R2Y_comp_.append(self.R2Y_abs_[0])
+                    r2y_ropls_cum.append(self.R2Y_abs_[0])
+                else:
+                    self.R2Y_comp_.append(self.R2Y_abs_[i] - self.R2Y_abs_[i-1])
+                    r2y_ropls_cum.append(self.R2Y_abs_[i] - self.R2Y_abs_[0])
+            self.R2Y_cum_list_ = r2y_ropls_cum
+        else:
+            self.R2X_comp_ = [self.R2X_]
+            self.R2X_cum_list_ = [self.R2X_]
+            self.R2Y_comp_ = [self.R2Y_abs_[-1]]
+            self.R2Y_cum_list_ = [self.R2Y_abs_[-1]]
 
         # ---- Process Categorical Fitted Labels ----
         if self._is_categorical and hasattr(self, 'fitted_values_'):
@@ -257,69 +285,127 @@ class OPLSDA:
             inv_trans = self.label_encoder.inverse_transform
             self.fitted_class_ = inv_trans(y_pred_idx)
 
-        # ---- Transform cumulative metrics into sequential increments ----
-        self.R2X_comp_ = []
-        self.R2Y_comp_ = []
-        for i in range(len(self.R2X_cum_list_)):
-            if i == 0:
-                self.R2X_comp_.append(self.R2X_cum_list_[i])
-                self.R2Y_comp_.append(self.R2Y_cum_list_[i])
+        # ---- Calculate VIP metrics based on user configuration ----
+        if self.vip_method == 'vip4':
+            sxp = np.nansum(self.t_pred_**2) * np.nansum(self.p_pred_**2)
+            if _n_ortho > 0:
+                sxo = sum(
+                    np.nansum(self.T_ortho_[:, j]**2) * np.nansum(self.P_ortho_[:, j]**2) 
+                    for j in range(_n_ortho)
+                )
             else:
-                inc_x = self.R2X_cum_list_[i] - self.R2X_cum_list_[i-1]
-                inc_y = self.R2Y_cum_list_[i] - self.R2Y_cum_list_[i-1]
-                self.R2X_comp_.append(inc_x)
-                self.R2Y_comp_.append(inc_y)
+                sxo = 0
+                
+            ssx_cum = sxp + sxo
+            syp = np.nansum(self.t_pred_**2) * (self.c_pred_**2)
+            ssy_cum = syp
 
-        # Calculate VIP
-        if _n_ortho > 0:
-            W_all = np.column_stack((self.w_pred_, self.W_ortho_))
-            P_all = np.column_stack((self.p_pred_, self.P_ortho_))
-            W_star = np.dot(W_all, np.linalg.inv(np.dot(P_all.T, W_all)))
-            w_star_pred = W_star[:, 0]
-        else:
-            w_star_pred = self.w_pred_
+            kp = n_features / ((sxp / ssx_cum) + (syp / ssy_cum))
+            p_norm = self.p_pred_ / np.sqrt(np.nansum(self.p_pred_**2))
             
-        w_star_pred /= np.linalg.norm(w_star_pred)
-        self.vip_ropls_ = np.sqrt(n_features * (w_star_pred ** 2))
+            term_x = (p_norm ** 2 * sxp) / ssx_cum
+            term_y = (p_norm ** 2 * syp) / ssy_cum
+            self.vip_ropls_ = np.sqrt(kp * (term_x + term_y))
+        else:
+            if _n_ortho > 0:
+                W_all = np.column_stack((self.w_pred_, self.W_ortho_))
+                P_all = np.column_stack((self.p_pred_, self.P_ortho_))
+                W_star = np.dot(W_all, np.linalg.inv(np.dot(P_all.T, W_all)))
+                w_star_pred = W_star[:, 0]
+            else:
+                w_star_pred = self.w_pred_
+                
+            w_star_pred /= np.linalg.norm(w_star_pred)
+            self.vip_ropls_ = np.sqrt(n_features * (w_star_pred ** 2))
 
-        # Dynamically calculate Covariance/Correlation for S-Plot
-        t_pred_flat = self.t_pred_.flatten()
-        self.covariances_ = np.zeros(n_features)
-        self.correlations_ = np.zeros(n_features)
-        for i in range(n_features):
-            xi = X[:, i]
-            self.covariances_[i] = np.cov(xi, t_pred_flat)[0, 1]
-            self.correlations_[i] = stats.pearsonr(xi, t_pred_flat)[0]
+        # ---- Calculate precise Covariance/Correlation for S-Plot ----
+        covariances = np.zeros(n_features)
+        correlations = np.zeros(n_features)
+        
+        X_centered = X - self.x_mean_
+        
+        for j in range(n_features):
+            mask = ~np.isnan(X_centered[:, j])
+            t_valid = self.t_pred_[mask]
+            x_valid = X_centered[mask, j]
+            
+            if len(t_valid) > 1:
+                cov_mat = np.cov(t_valid, x_valid)
+                covariances[j] = cov_mat[0, 1]
+                
+                std_t = np.std(t_valid, ddof=1)
+                std_x = np.std(x_valid, ddof=1)
+                if std_t > 0 and std_x > 0:
+                    correlations[j] = covariances[j] / (std_t * std_x)
+                    
+        self.covariances_ = covariances
+        self.correlations_ = correlations
+
+        # ---- Calculate Outlier Diagnostics (SD and OD) ----
+        # Orthogonal Distance (OD): Norm of the final residual matrix E
+        E_res = E_orig.copy()
+        pred_hat = np.outer(self.t_pred_, self.p_pred_)
+        E_res = E_res - pred_hat
+        for i in range(_n_ortho):
+            ortho_hat = np.outer(self.T_ortho_[:, i], self.P_ortho_[:, i])
+            E_res = E_res - ortho_hat
+            
+        # NaN-safe calculation of OD
+        sq_res = E_res ** 2
+        self.OD_ = np.sqrt(np.nanmean(sq_res, axis=1) * n_features)
+
+        # Score Distance (SD): Mahalanobis distance in score space
+        if _n_ortho > 0:
+            T_all = np.column_stack((self.t_pred_, self.T_ortho_))
+        else:
+            T_all = self.t_pred_[:, np.newaxis]
+            
+        T_var = np.var(T_all, axis=0, ddof=1)
+        T_var[T_var == 0] = 1e-10  # Prevent division by zero
+        
+        self.SD_ = np.sqrt(np.sum((T_all ** 2) / T_var, axis=1))
+
+        # ---- Calculate Outlier Limits (Moved from Plotting) ----
+        from scipy.stats import chi2, norm
+        
+        # SD 95% Limit (Chi-Square)
+        n_comps = 1 + getattr(self, 'n_ortho', 0)
+        self.sd_limit_ = np.sqrt(chi2.ppf(0.95, df=n_comps))
+        
+        # OD 95% Limit (Jackson-Mudholkar approximation)
+        od_vals = self.OD_
+        if len(od_vals) > 1:
+            od_23 = od_vals ** (2 / 3)
+            mu_od = np.mean(od_23)
+            std_od = np.std(od_23, ddof=1)
+            self.od_limit_ = (mu_od + norm.ppf(0.95) * std_od) ** (3 / 2)
+        else:
+            self.od_limit_ = np.max(od_vals) * 1.1
 
         return self
 
     def _predict_continuous(self, X):
-        """Internal method to predict continuous target values.
-
-        Args:
-            X (np.ndarray): Feature matrix to predict.
-
-        Returns:
-            np.ndarray: Predicted continuous values.
-        """
+        """Internal method to predict continuous target values safely."""
         X = np.asarray(X, dtype=float)
         E = (X - self.x_mean_) / self.x_std_
+        
         for i in range(self.n_ortho):
-            t_ortho = np.dot(E, self.W_ortho_[:, i])
+            valid_mask = ~np.isnan(E)
+            w_o_sq = self.W_ortho_[:, i] ** 2
+            t_ortho = np.nansum(E * self.W_ortho_[:, i], axis=1) 
+            t_ortho /= np.sum(valid_mask * w_o_sq, axis=1)
             E -= np.outer(t_ortho, self.P_ortho_[:, i])
-        t_pred = np.dot(E, self.w_pred_)
+            
+        valid_mask = ~np.isnan(E)
+        w_p_sq = self.w_pred_ ** 2
+        t_pred = np.nansum(E * self.w_pred_, axis=1) 
+        t_pred /= np.sum(valid_mask * w_p_sq, axis=1)
+        
         y_pred_num = (t_pred * self.c_pred_) * self.y_std_ + self.y_mean_
         return y_pred_num
 
     def predict(self, X):
-        """Predicts class labels or continuous values for the input data.
-
-        Args:
-            X (array-like): Feature matrix.
-
-        Returns:
-            array-like: Predicted class labels or continuous values.
-        """
+        """Predicts class labels or continuous values for the input data."""
         y_pred_num = self._predict_continuous(X)
         if self._is_categorical:
             n_classes = len(self.label_encoder.classes_)
@@ -330,15 +416,7 @@ class OPLSDA:
         return y_pred_num
 
     def compute_q2(self, X, y):
-        """Calculates the Q2 cross-validated predictive ability.
-
-        Args:
-            X (array-like): Feature matrix.
-            y (array-like): Target vector.
-
-        Returns:
-            float: The global Q2 score of the model.
-        """
+        """Calculates the Q2 cross-validated predictive ability."""
         X = np.asarray(X, dtype=float)
         if self._is_categorical:
             y_num = self.label_encoder.transform(y).astype(float)
@@ -354,95 +432,64 @@ class OPLSDA:
             X_test = X[test_idx]
             
             for n in range(n_ortho_plus_1):
-                model_cv = OPLSDA(n_ortho=n, cv_folds=self.cv_folds)
+                model_cv = OPLSDA(
+                    n_ortho=n, 
+                    cv_folds=self.cv_folds, 
+                    vip_method=self.vip_method
+                )
                 model_cv.fit(X_train, y_train)
                 y_cv_preds[n][test_idx] = model_cv._predict_continuous(X_test)
                 
-        SS_Y = np.sum((y_num - y_num.mean()) ** 2)
+        SS_Y = np.nansum((y_num - np.nanmean(y_num)) ** 2)
         PRESS_list = [
-            np.sum((y_num - y_cv_preds[n]) ** 2) 
+            np.nansum((y_num - y_cv_preds[n]) ** 2) 
             for n in range(n_ortho_plus_1)
         ]
         
+        self.Q2_abs_ = [1.0 - (press / SS_Y) for press in PRESS_list]
         self.Q2_comp_ = []
         self.Q2_cum_list_ = []
         
-        for i in range(len(PRESS_list)):
-            cum_q2 = 1.0 - PRESS_list[i] / SS_Y
-            self.Q2_cum_list_.append(cum_q2)
+        for i in range(len(self.Q2_abs_)):
             if i == 0:
-                self.Q2_comp_.append(cum_q2)
+                self.Q2_comp_.append(self.Q2_abs_[0])
+                self.Q2_cum_list_.append(self.Q2_abs_[0])
             else:
-                prev_press = PRESS_list[i-1] if PRESS_list[i-1] != 0 else 1e-10
-                self.Q2_comp_.append(1.0 - PRESS_list[i] / prev_press)
+                self.Q2_comp_.append(self.Q2_abs_[i] - self.Q2_abs_[i-1])
+                # Mirrors ropls: Q2(cum) for ortho is relative to step 0
+                self.Q2_cum_list_.append(self.Q2_abs_[i] - self.Q2_abs_[0])
                 
-        self.Q2_ = 1.0 - (PRESS_list[-1] / SS_Y)
+        self.Q2_ = self.Q2_abs_[-1]
         return self.Q2_
 
     def _single_permutation(self, X, y_numeric, n_ortho, cv_folds):
-        """Runs a single iteration of the permutation test.
-
-        Args:
-            X (np.ndarray): Feature matrix.
-            y_numeric (np.ndarray): Original numeric target vector.
-            n_ortho (int): Number of orthogonal components.
-            cv_folds (int): Number of cross-validation folds.
-
-        Returns:
-            tuple: Permuted (R2Y, Q2) metrics.
-        """
+        """Runs a single iteration of the permutation test."""
+        np.random.seed()
         y_perm = np.random.permutation(y_numeric) 
-        model_perm = OPLSDA(n_ortho=n_ortho, cv_folds=cv_folds)
+        model_perm = OPLSDA(
+            n_ortho=n_ortho, cv_folds=cv_folds, vip_method=self.vip_method
+        )
         model_perm.fit(X, y_perm)
         q2 = model_perm.compute_q2(X, y_perm)
-        return model_perm.R2Y_, q2
+        return model_perm.R2Y_abs_[-1], q2
 
-    def permutation_test(self, X, y, n_perms=100, n_jobs=-1):
-        """Perform a permutation test to assess model significance.
-
-        It randomly shuffles the target variable 'y' and re-fits the
-        model to calculate the permuted R2Y and Q2 values, strictly
-        aligning with the ropls algorithm.
-
-        Args:
-            X (pd.DataFrame, np.ndarray]): The feature matrix
-                of shape (n_samples, n_features).
-            y (pd.Series, np.ndarray): The target variable
-                (labels) of shape (n_samples,).
-            n_perms (int, optional): Number of permutations to
-                perform. Defaults to 100.
-            n_jobs (int, optional): Number of CPU cores to use. -1
-                means using all processors. Defaults to -1.
-
-        Raises:
-            ValueError: If all permutation iterations fail to converge.
-
-        Returns:
-            Dict: A dictionary containing original metrics,
-                permuted arrays, and empirical p-values.
-                - 'orig_R2Y' (float): Original R2Y value.
-                - 'orig_Q2' (float): Original Q2 value.
-                - 'perms_R2Y' (list of float): Permuted R2Y values.
-                - 'perms_Q2' (list of float): Permuted Q2 values.
-                - 'p_R2Y' (float): Empirical p-value for R2Y.
-                - 'p_Q2' (float): Empirical p-value for Q2.
-                - 'valid_perms' (int): Number of successful permutations.
-        """
-        # 1. Data Validation & Formatting
+    def permutation_test(self, X, y, n_perms=None, n_jobs=None):
+        """Perform a permutation test to assess model significance."""
+        n_perms = n_perms or self.n_perms
+        n_jobs = n_jobs or self.n_jobs
+        
         X_mat = X.values if hasattr(X, 'values') else np.array(X)
         y_arr = y.values if hasattr(y, 'values') else np.array(y)
         
-        # Ensure y is numeric for the core NIPALS/PLS algorithm
-        if hasattr(self, '_encode_labels'):
-            y_numeric = self._encode_labels(y_arr)
+        if self._is_categorical:
+            y_numeric = self.label_encoder.transform(y_arr).astype(float)
         else:
-            y_numeric = y_arr
+            y_numeric = y_arr.astype(float)
 
         print(
             f"Starting parallel permutation test ({n_perms} permutations)..."
         )
 
-        # 2. Parallel Computation with Generator
         current_n_ortho = getattr(self, 'n_ortho', 1) 
         current_cv_folds = getattr(self, 'cv_folds', 7)
         
@@ -452,14 +499,12 @@ class OPLSDA:
             for _ in range(n_perms)
         )
 
-        # 3. Dynamic Progress Bar Integration
         pbar = get_custom_progress(
             results_gen, total=n_perms, desc="Permutation Test",
-            color = "#2CA02C", bar_length = 60
+            color="#2CA02C", bar_length=60
         )
         results = list(pbar)
 
-        # 4. Extract Permuted Metrics (Simplified, no defensive checks needed)
         perms_R2Y = [res[0] for res in results]
         perms_Q2 = [res[1] for res in results]
 
@@ -467,29 +512,25 @@ class OPLSDA:
         if valid_perms == 0:
             raise ValueError("All permutation iterations failed to converge.")
 
-        # 5. Retrieve Original Metrics
-        orig_R2Y = getattr(self, 'R2Y_', 0)
+        orig_R2Y = getattr(self, 'R2Y_abs_', [0])[-1]
         orig_Q2 = getattr(self, 'Q2_', 0)
 
-        # 6. Calculate Empirical P-Values
         count_R2Y = sum(1 for val in perms_R2Y if val >= orig_R2Y)
         count_Q2 = sum(1 for val in perms_Q2 if val >= orig_Q2)
 
         p_R2Y = (count_R2Y + 1) / (valid_perms + 1)
         p_Q2 = (count_Q2 + 1) / (valid_perms + 1)
 
-        # Save p-values to the class instance for downstream reporting
         self.p_R2Y_ = p_R2Y
         self.p_Q2_ = p_Q2
         
-        # 7. Return Structured Results for Visualization (OPLSDA_Visualizer)
         return {
             'orig_R2Y': orig_R2Y,
-            'orig_Q2': orig_Q2,
-            'perms_R2Y': perms_R2Y,
-            'perms_Q2': perms_Q2,
+            'orig_Q2Y': orig_Q2,
+            'perm_R2Y': perms_R2Y,
+            'perm_Q2Y': perms_Q2,
             'p_R2Y': p_R2Y,
-            'p_Q2': p_Q2,
+            'p_Q2Y': p_Q2,
             'valid_perms': valid_perms
         }
 
@@ -497,12 +538,7 @@ class OPLSDA:
     # DataFrame Export Methods (ropls aligned)
     # ==========================================
     def get_model_info_df(self):
-        """Exports the global model metadata (Matches ropls getSummaryDF).
-
-        Returns:
-            pd.DataFrame: A single-row DataFrame containing overall n_ortho, 
-                cumulative R2X/R2Y/Q2, RMSEE, and permutation p-values.
-        """
+        """Exports the global model metadata (Matches ropls getSummaryDF)."""
         if not hasattr(self, 'Q2_'):
             raise ValueError("Model must compute Q2 first.")
             
@@ -510,8 +546,8 @@ class OPLSDA:
             'N_Predictive': [1],
             'N_Ortho': [self.n_ortho],
             'R2X(cum)': [self.R2X_cum_list_[-1]],
-            'R2Y(cum)': [self.R2Y_cum_list_[-1]],
-            'Q2(cum)': [self.Q2_],
+            'R2Y(cum)': [self.R2Y_abs_[-1]],
+            'Q2(cum)': [self.Q2_abs_[-1]],
             'RMSEE': [self.RMSEE_]
         }
         
@@ -522,17 +558,14 @@ class OPLSDA:
         return pd.DataFrame(data)
 
     def get_summary_df(self):
-        """Exports the step-wise incremental and cumulative metrics.
-
-        Returns:
-            pd.DataFrame: DataFrame containing R2X, R2Y, and Q2 metrics 
-                for each extracted component.
-        """
+        """Exports the step-wise incremental and cumulative metrics."""
         if not hasattr(self, 'Q2_comp_'):
             raise ValueError("Model must compute Q2 first.")
             
         n_ortho = getattr(self, 'n_ortho', 0)
-        components = ['p1'] + [f'o{i+1}' for i in range(n_ortho)]
+        components = ['Predictive (p1)'] + [
+            f'Orthogonal (o{i+1})' for i in range(n_ortho)
+        ]
         
         return pd.DataFrame({
             'Component': components, 
@@ -545,16 +578,7 @@ class OPLSDA:
         })
 
     def get_scores_df(self, sample_names=None, y_true=None):
-        """Exports sample scores, fitted values/classes, and evaluation metrics.
-
-        Args:
-            sample_names (list, optional): Sample names. Defaults to None.
-            y_true (array-like, optional): True class labels. Defaults to None.
-
-        Returns:
-            pd.DataFrame: DataFrame containing T scores, predictions, and 
-                prediction match status.
-        """
+        """Exports sample scores, fitted values/classes, and evaluation metrics."""
         n_samples = self.t_pred_.shape[0]
         if sample_names is not None: 
             names = sample_names
@@ -563,11 +587,11 @@ class OPLSDA:
         else: 
             names = [f"S_{i}" for i in range(n_samples)]
         
-        data = {'Sample': names, 't_pred': self.t_pred_.flatten()}
+        data = {'Sample': names, 't_pred (p1)': self.t_pred_.flatten()}
         n_ortho = getattr(self, 'n_ortho', 0)
         
         for i in range(n_ortho):
-            data[f't_ortho_{i+1}'] = self.T_ortho_[:, i]
+            data[f't_ortho (o{i+1})'] = self.T_ortho_[:, i]
             
         if y_true is not None: 
             data['True_Class'] = np.asarray(y_true)
@@ -589,15 +613,7 @@ class OPLSDA:
         return df
 
     def get_features_df(self, feature_names=None):
-        """Exports feature selection metrics (VIP, Covariance, Correlation).
-
-        Args:
-            feature_names (list, optional): Feature names. Defaults to None.
-
-        Returns:
-            pd.DataFrame: DataFrame containing feature metrics, 
-                sorted by VIP in descending order.
-        """
+        """Exports feature selection metrics (VIP, Covariance, Correlation)."""
         n_features = len(self.vip_ropls_)
         if feature_names is not None: 
             names = feature_names
@@ -614,3 +630,31 @@ class OPLSDA:
             'Loading_Weight': self.p_pred_.flatten()
         })
         return df.sort_values(by='VIP', ascending=False).reset_index(drop=True)
+
+    def get_outlier_df(self, sample_names=None, y_true=None):
+        """Exports Score/Orthogonal Distances and outlier limit flags."""
+        n_samples = getattr(self, 'SD_', []).shape[0] if hasattr(
+            self, 'SD_') else 0
+            
+        if sample_names is not None: 
+            names = sample_names
+        elif hasattr(self, 'sample_names_in_'): 
+            names = self.sample_names_in_
+        else: 
+            names = [f"S_{i}" for i in range(n_samples)]
+            
+        df = pd.DataFrame({
+            'Sample': names,
+            'Score_Distance': getattr(self, 'SD_', []),
+            'Orthogonal_Distance': getattr(self, 'OD_', [])
+        })
+        
+        # Add flags for limit exceedance
+        if hasattr(self, 'sd_limit_') and hasattr(self, 'od_limit_'):
+            df['Exceeds_SD_Limit'] = df['Score_Distance'] > self.sd_limit_
+            df['Exceeds_OD_Limit'] = df['Orthogonal_Distance'] > self.od_limit_
+        
+        if y_true is not None: 
+            df['True_Class'] = np.asarray(y_true)
+            
+        return df
