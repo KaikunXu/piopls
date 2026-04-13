@@ -61,12 +61,8 @@ We provide interactive Jupyter Notebooks that walk you through the entire OPLS-D
 
 * **[Quickstart Tutorial](examples/quickstart_en.ipynb)**: A comprehensive guide from data loading to visualization and prediction.
 <<<<<<< Updated upstream
-* **[R-ropls Equivalence Benchmark](examples/equivalence_benchmark.ipynb)**: The complete script used to prove numerical consistency between Python and R implementations.
-
-## 📈 Generated Diagnostic Plots
-=======
 * **[R-ropls Equivalence Benchmark](examples/benchmark.ipynb)**: The complete script used to prove numerical consistency between Python and R implementations.
->>>>>>> Stashed changes
+
 
 ## 📈 Visualization
 <p align="center">
